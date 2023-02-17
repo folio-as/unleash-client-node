@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { trace, ROOT_CONTEXT, SpanStatusCode } from '@opentelemetry/api';
 import { post } from './request';
 import { CustomHeaders, CustomHeadersFunction } from './headers';
 import { sdkVersion } from './details.json';
@@ -201,51 +202,67 @@ export default class Metrics extends EventEmitter {
   }
 
   async sendMetrics(): Promise<void> {
-    if (this.disabled) {
-      return;
-    }
-    if (this.bucketIsEmpty()) {
-      this.resetBucket();
-      this.startTimer();
-      return;
-    }
-    const url = resolveUrl(suffixSlash(this.url), './client/metrics');
-    const payload = this.createMetricsData();
+    await trace
+      .getTracer('unleash-client')
+      .startActiveSpan('send-metrics', {}, ROOT_CONTEXT, async (span) => {
+        try {
+          if (this.disabled) {
+            return;
+          }
+          if (this.bucketIsEmpty()) {
+            this.resetBucket();
+            this.startTimer();
+            return;
+          }
+          const url = resolveUrl(suffixSlash(this.url), './client/metrics');
+          const payload = this.createMetricsData();
 
-    const headers = this.customHeadersFunction ? await this.customHeadersFunction() : this.headers;
+          // eslint-disable-next-line max-len
+          const headers = this.customHeadersFunction ? await this.customHeadersFunction() : this.headers;
 
-    try {
-      const res = await post({
-        url,
-        json: payload,
-        appName: this.appName,
-        instanceId: this.instanceId,
-        headers,
-        timeout: this.timeout,
-        httpOptions: this.httpOptions,
-      });
-      if (!res.ok) {
-        if (res.status === 404 || res.status === 403 || res.status == 401) {
-          this.configurationError(url, res.status);
-        } else if (
-          res.status === 429 ||
-          res.status === 500 ||
-          res.status === 502 ||
-          res.status === 503 ||
-          res.status === 504
-        ) {
-          this.backoff(url, res.status);
+          try {
+            const res = await post({
+              url,
+              json: payload,
+              appName: this.appName,
+              instanceId: this.instanceId,
+              headers,
+              timeout: this.timeout,
+              httpOptions: this.httpOptions,
+            });
+            if (!res.ok) {
+              if (res.status === 404 || res.status === 403 || res.status == 401) {
+                this.configurationError(url, res.status);
+              } else if (
+                res.status === 429 ||
+                res.status === 500 ||
+                res.status === 502 ||
+                res.status === 503 ||
+                res.status === 504
+              ) {
+                this.backoff(url, res.status);
+              }
+              this.restoreBucket(payload.bucket);
+            } else {
+              this.emit(UnleashEvents.Sent, payload);
+              this.reduceBackoff();
+            }
+          } catch (err) {
+            this.restoreBucket(payload.bucket);
+            this.emit(UnleashEvents.Warn, err);
+            this.startTimer();
+          }
+        } catch (err: any) {
+          span
+            .setStatus({
+              message: 'Unable to push metrics',
+              code: SpanStatusCode.ERROR,
+            })
+            .recordException(err);
+        } finally {
+          span.end();
         }
-        this.restoreBucket(payload.bucket);
-      } else {
-        this.emit(UnleashEvents.Sent, payload);
-        this.reduceBackoff();
-      }
-    } catch (err) {
-      this.restoreBucket(payload.bucket);
-      this.emit(UnleashEvents.Warn, err);
-      this.startTimer();
-    }
+      });
   }
 
   reduceBackoff(): void {

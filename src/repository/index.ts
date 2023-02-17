@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { ROOT_CONTEXT, SpanStatusCode, trace } from '@opentelemetry/api';
 import { ClientFeaturesResponse, EnhancedFeatureInterface, FeatureInterface } from '../feature';
 import { get } from '../request';
 import { CustomHeaders, CustomHeadersFunction } from '../headers';
@@ -330,60 +331,75 @@ Message: ${err.message}`,
   }
 
   async fetch(): Promise<void> {
-    if (this.stopped || !(this.refreshInterval > 0)) {
-      return;
-    }
-    let nextFetch = this.refreshInterval;
-    try {
-      let mergedTags;
-      if (this.tags) {
-        mergedTags = this.mergeTagsToStringArray(this.tags);
-      }
-      const url = getUrl(this.url, this.projectName, this.namePrefix, mergedTags);
-
-      const headers = this.customHeadersFunction
-        ? await this.customHeadersFunction()
-        : this.headers;
-      const res = await get({
-        url,
-        etag: this.etag,
-        appName: this.appName,
-        timeout: this.timeout,
-        instanceId: this.instanceId,
-        headers,
-        httpOptions: this.httpOptions,
-        supportedSpecVersion: SUPPORTED_SPEC_VERSION,
-      });
-      if (res.status === 304) {
-        // No new data
-        this.emit(UnleashEvents.Unchanged);
-      } else if (res.ok) {
-        nextFetch = this.countSuccess();
+    await trace
+      .getTracer('unleah-client')
+      .startActiveSpan('fetch-toggles', {}, ROOT_CONTEXT, async (span) => {
         try {
-          const data: ClientFeaturesResponse = await res.json();
-          if (res.headers.get('etag') !== null) {
-            this.etag = res.headers.get('etag') as string;
-          } else {
-            this.etag = undefined;
+          if (this.stopped || !(this.refreshInterval > 0)) {
+            return;
           }
-          await this.save(data, true);
-        } catch (err) {
-          this.emit(UnleashEvents.Error, err);
+          let nextFetch = this.refreshInterval;
+          try {
+            let mergedTags;
+            if (this.tags) {
+              mergedTags = this.mergeTagsToStringArray(this.tags);
+            }
+            const url = getUrl(this.url, this.projectName, this.namePrefix, mergedTags);
+
+            const headers = this.customHeadersFunction
+              ? await this.customHeadersFunction()
+              : this.headers;
+            const res = await get({
+              url,
+              etag: this.etag,
+              appName: this.appName,
+              timeout: this.timeout,
+              instanceId: this.instanceId,
+              headers,
+              httpOptions: this.httpOptions,
+              supportedSpecVersion: SUPPORTED_SPEC_VERSION,
+            });
+            if (res.status === 304) {
+              // No new data
+              this.emit(UnleashEvents.Unchanged);
+            } else if (res.ok) {
+              nextFetch = this.countSuccess();
+              try {
+                const data: ClientFeaturesResponse = await res.json();
+                if (res.headers.get('etag') !== null) {
+                  this.etag = res.headers.get('etag') as string;
+                } else {
+                  this.etag = undefined;
+                }
+                await this.save(data, true);
+              } catch (err) {
+                this.emit(UnleashEvents.Error, err);
+              }
+            } else {
+              nextFetch = this.handleErrorCases(url, res.status);
+            }
+          } catch (err) {
+            const e = err as { code: string };
+            if (e.code === 'ECONNRESET') {
+              nextFetch = Math.max(Math.floor(this.refreshInterval / 2), 1000);
+              this.emit(UnleashEvents.Warn, `Socket keep alive error, retrying in ${nextFetch}ms`);
+            } else {
+              this.emit(UnleashEvents.Error, err);
+            }
+          } finally {
+            this.timedFetch(nextFetch);
+          }
+        } catch (err: any) {
+          span
+            .setStatus({
+              message: 'Unable to fetch toggles',
+              code: SpanStatusCode.ERROR,
+            })
+            .recordException(err);
+        } finally {
+          span.end();
         }
-      } else {
-        nextFetch = this.handleErrorCases(url, res.status);
-      }
-    } catch (err) {
-      const e = err as { code: string };
-      if (e.code === 'ECONNRESET') {
-        nextFetch = Math.max(Math.floor(this.refreshInterval / 2), 1000);
-        this.emit(UnleashEvents.Warn, `Socket keep alive error, retrying in ${nextFetch}ms`);
-      } else {
-        this.emit(UnleashEvents.Error, err);
-      }
-    } finally {
-      this.timedFetch(nextFetch);
-    }
+      });
   }
 
   mergeTagsToStringArray(tags: Array<TagFilter>): Array<string> {
